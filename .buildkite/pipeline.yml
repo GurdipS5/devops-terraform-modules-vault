@@ -1,0 +1,1107 @@
+# Template Pipeline for Terraform Module Callers
+# This pipeline is designed for repos that CALL/CONSUME Terraform modules
+# NOT for the module repos themselves
+
+env:
+  # ====================
+  # PROJECT CONFIGURATION
+  # ====================
+  PROJECT_NAME: "{{project_name}}"           # e.g., "app-infrastructure"
+  SERVICE_NAME: "{{service_name}}"           # e.g., "api-gateway"
+  
+  # ====================
+  # DEPLOYMENT CONFIGURATION
+  # ====================
+  TARGET_ENVIRONMENTS: "{{environments}}"    # e.g., "dev,stg,prd"
+  REQUIRE_APPROVAL: "{{require_approval}}"   # true, false
+  
+  # ====================
+  # SECURITY CONFIGURATION
+  # ====================
+  MIN_COMPLIANCE_SCORE: "{{compliance_score}}"  # e.g., "85"
+  ENABLE_SECRET_SCANNING: "true"
+  
+  # ====================
+  # NOTIFICATION CONFIGURATION
+  # ====================
+  WEBHOOK_URL: "{{webhook_url}}"             # e.g., "https://webhooks.company.com/hooks/terraform-alerts"
+  NOTIFICATION_LEVEL: "all"                  # errors-only, deployments, all
+  
+  # ====================
+  # INFRASTRUCTURE CONFIGURATION
+  # ====================
+  VAULT_NAMESPACE: "{{vault_namespace}}"     # e.g., "DevOps/prd/app-infrastructure"
+  VAULT_SSH_NAMESPACE: "{{vault_ssh_namespace}}"  # e.g., "DevOps/shared/ssh-keys"
+  VAULT_COSIGN_NAMESPACE: "{{vault_cosign_namespace}}"  # e.g., "DevOps/shared/cosign"
+  VAULT_GPG_NAMESPACE: "{{vault_gpg_namespace}}"  # e.g., "DevOps/shared/gpg-keys"
+  VAULT_ADDR: "{{vault_addr}}"               # e.g., "http://vault.example.com:8200"
+  LYNX_BASE_URL: "{{lynx_url}}"              # e.g., "https://lynx.example.com"
+  BACKUP_RETENTION_DAYS: "30"
+  
+  # ====================
+  # VAULT APPROLE CONFIGURATION
+  # Note: Role IDs and Secret IDs are stored in Buildkite secrets:
+  # - Main namespace: DEVOPS_TERRAFORM_SERVICES_HARBOR_ROLEID / SECRETID
+  # - Cosign namespace: VAULT_COSIGN_ROLE_ID / VAULT_COSIGN_SECRET_ID
+  # - GPG namespace: VAULT_GPG_ROLE_ID / VAULT_GPG_SECRET_ID
+  # ====================
+  
+  # ====================
+  # PROVIDER CONFIGURATION
+  # ====================
+  REQUIRED_PROVIDERS: "{{required_providers}}"  # e.g., "mondoo,netlify,aws,azure"
+  
+  # ====================
+  # MODULE CONFIGURATION
+  # ====================
+  MODULE_REGISTRY_URL: "{{module_registry}}"  # e.g., "registry.terraform.io/yourorg"
+  MODULE_VERSION_CONSTRAINT: "{{module_version}}"  # e.g., ">= 1.0.0, < 2.0.0"
+  
+  # ====================
+  # HELPER SCRIPTS CONFIGURATION
+  # ====================
+  HELPER_SCRIPTS_REPO: "{{helper_scripts_repo}}"
+  HELPER_SCRIPTS_REF: "{{helper_scripts_ref}}"
+  
+  # ====================
+  # OPA POLICY CONFIGURATION
+  # ====================
+  OPA_BUNDLE_URL: "{{opa_bundle_url}}"       # e.g., "https://opa.example.com/bundles/terraform"
+  OPA_POLICY_PATH: "{{opa_policy_path}}"     # e.g., "terraform/compliance"
+  ENABLE_OPA_VALIDATION: "true"
+  
+  # ====================
+  # FEATURE FLAGS
+  # ====================
+  ENABLE_AUTO_DOCUMENTATION: "true"
+  ENABLE_SEMANTIC_VERSIONING: "false"
+  VALIDATE_CONVENTIONAL_COMMITS: "false"
+
+steps:
+  # ============================================================================
+  # PHASE 0: SETUP
+  # ============================================================================
+  
+  - group: "🔧 Setup Phase"
+    key: "setup-phase"
+    steps:
+      
+      - label: ":git: Checkout Helper Scripts"
+        key: "checkout-helpers"
+        commands:
+          - |
+            if (Test-Path ".\\scripts") { Remove-Item -Recurse -Force ".\\scripts" }
+            git clone --depth 1 --branch $env:HELPER_SCRIPTS_REF $env:HELPER_SCRIPTS_REPO .\\scripts
+        agents:
+          queue: "windows"
+
+      - label: ":vault: Fetch Secrets via AppRole"
+        key: "fetch-secrets"
+        commands:
+          - |
+            Write-Host "--- :vault: Authenticating to Vault via AppRole"
+            
+            # Authenticate to Vault using AppRole
+            $authBody = @{
+              role_id = $env:DEVOPS_TERRAFORM_SERVICES_HARBOR_ROLEID
+              secret_id = $env:DEVOPS_TERRAFORM_SERVICES_HARBOR_SECRETID
+            } | ConvertTo-Json
+            
+            $authResponse = Invoke-RestMethod -Uri "$env:VAULT_ADDR/v1/auth/approle/login" `
+              -Method POST `
+              -ContentType "application/json" `
+              -Body $authBody
+            
+            $vaultToken = $authResponse.auth.client_token
+            $headers = @{ "X-Vault-Token" = $vaultToken }
+            
+            Write-Host "✅ Vault authentication successful"
+            
+            # Create secrets directories
+            New-Item -ItemType Directory -Force -Path ".\\secrets\\providers" | Out-Null
+            New-Item -ItemType Directory -Force -Path ".\\secrets\\ssh" | Out-Null
+            
+            # Fetch Lynx credentials
+            Write-Host "--- :key: Fetching Lynx credentials"
+            $lynxSecrets = Invoke-RestMethod -Uri "$env:VAULT_ADDR/v1/$env:VAULT_NAMESPACE/data/lynx" `
+              -Headers $headers
+            $lynxSecrets.data.data | ConvertTo-Json | Out-File ".\\secrets\\lynx.json"
+            Write-Host "✅ Fetched Lynx credentials"
+            
+            # Fetch provider credentials
+            Write-Host "--- :key: Fetching provider credentials"
+            $providers = $env:REQUIRED_PROVIDERS -split ","
+            foreach ($provider in $providers) {
+              $provider = $provider.Trim()
+              try {
+                $secrets = Invoke-RestMethod -Uri "$env:VAULT_ADDR/v1/$env:VAULT_NAMESPACE/data/providers/$provider" `
+                  -Headers $headers
+                $secrets.data.data | ConvertTo-Json | Out-File ".\\secrets\\providers\\$provider.json"
+                Write-Host "✅ Fetched secrets for $provider"
+              } catch {
+                Write-Warning "⚠️ No secrets found for $provider"
+              }
+            }
+            
+            # Fetch SSH credentials from separate namespace
+            Write-Host "--- :closed_lock_with_key: Fetching SSH credentials"
+            try {
+              $sshSecrets = Invoke-RestMethod -Uri "$env:VAULT_ADDR/v1/$env:VAULT_SSH_NAMESPACE/data/github" `
+                -Headers $headers
+              
+              # Save SSH private key
+              $sshSecrets.data.data.private_key | Out-File ".\\secrets\\ssh\\id_rsa" -Encoding ASCII -NoNewline
+              
+              # Save SSH config/metadata
+              $sshConfig = @{
+                fingerprint = $sshSecrets.data.data.fingerprint
+                public_key = $sshSecrets.data.data.public_key
+                git_user = $sshSecrets.data.data.git_user
+                git_email = $sshSecrets.data.data.git_email
+              } | ConvertTo-Json
+              $sshConfig | Out-File ".\\secrets\\ssh\\config.json"
+              
+              Write-Host "✅ Fetched SSH credentials"
+            } catch {
+              Write-Warning "⚠️ Failed to fetch SSH credentials: $_"
+            }
+            
+            # Fetch OPA bundle credentials if OPA validation enabled
+            if ($env:ENABLE_OPA_VALIDATION -eq "true") {
+              Write-Host "--- :opa: Fetching OPA credentials"
+              try {
+                $opaSecrets = Invoke-RestMethod -Uri "$env:VAULT_ADDR/v1/$env:VAULT_NAMESPACE/data/opa" `
+                  -Headers $headers
+                $opaSecrets.data.data | ConvertTo-Json | Out-File ".\\secrets\\opa.json"
+                Write-Host "✅ Fetched OPA credentials"
+              } catch {
+                Write-Warning "⚠️ No OPA credentials found, will try anonymous access"
+              }
+            }
+        artifact_paths:
+          - ".secrets/**/*"
+        agents:
+          queue: "windows"
+        depends_on: "checkout-helpers"
+
+      - label: ":pencil2: Fetch Cosign Credentials"
+        key: "fetch-cosign-secrets"
+        plugins:
+          - vault-secrets#v2.4.0:
+              server: "${VAULT_ADDR}"
+              path: "${VAULT_COSIGN_NAMESPACE}"
+              auth:
+                method: "approle"
+                role-id: "${VAULT_COSIGN_ROLE_ID}"
+                secret-env: "VAULT_COSIGN_SECRET_ID"
+        commands:
+          - |
+            Write-Host "--- :pencil2: Storing Cosign credentials"
+            
+            # Create cosign secrets directory
+            New-Item -ItemType Directory -Force -Path ".\\secrets\\cosign" | Out-Null
+            
+            # The plugin exposes secrets from {path}/env as environment variables
+            # Expected Vault structure: {VAULT_COSIGN_NAMESPACE}/env with keys:
+            #   COSIGN_PRIVATE_KEY, COSIGN_PUBLIC_KEY, COSIGN_PASSWORD
+            $env:COSIGN_PRIVATE_KEY | Out-File ".\\secrets\\cosign\\cosign.key" -Encoding ASCII -NoNewline
+            $env:COSIGN_PUBLIC_KEY | Out-File ".\\secrets\\cosign\\cosign.pub" -Encoding ASCII -NoNewline
+            
+            if ($env:COSIGN_PASSWORD) {
+              $env:COSIGN_PASSWORD | Out-File ".\\secrets\\cosign\\password.txt" -Encoding ASCII -NoNewline
+            }
+            
+            Write-Host "✅ Cosign credentials stored"
+        artifact_paths:
+          - ".secrets/cosign/**/*"
+        agents:
+          queue: "windows"
+        depends_on: "checkout-helpers"
+
+      - label: ":lock: Fetch GPG Credentials"
+        key: "fetch-gpg-secrets"
+        plugins:
+          - vault-secrets#v2.4.0:
+              server: "${VAULT_ADDR}"
+              path: "${VAULT_GPG_NAMESPACE}"
+              auth:
+                method: "approle"
+                role-id: "${VAULT_GPG_ROLE_ID}"
+                secret-env: "VAULT_GPG_SECRET_ID"
+        commands:
+          - |
+            Write-Host "--- :lock: Storing GPG credentials"
+            
+            # Create GPG secrets directory
+            New-Item -ItemType Directory -Force -Path ".\\secrets\\gpg" | Out-Null
+            
+            # The plugin exposes secrets from {path}/env as environment variables
+            # Expected Vault structure: {VAULT_GPG_NAMESPACE}/env with keys:
+            #   GPG_PRIVATE_KEY, GPG_PUBLIC_KEY, GPG_KEY_ID, GPG_FINGERPRINT, 
+            #   GPG_PASSPHRASE, GPG_GIT_USER, GPG_GIT_EMAIL
+            $env:GPG_PRIVATE_KEY | Out-File ".\\secrets\\gpg\\private.asc" -Encoding ASCII -NoNewline
+            $env:GPG_PUBLIC_KEY | Out-File ".\\secrets\\gpg\\public.asc" -Encoding ASCII -NoNewline
+            
+            # Save GPG metadata
+            $gpgConfig = @{
+              key_id = $env:GPG_KEY_ID
+              fingerprint = $env:GPG_FINGERPRINT
+              passphrase = $env:GPG_PASSPHRASE
+              git_user = $env:GPG_GIT_USER
+              git_email = $env:GPG_GIT_EMAIL
+            } | ConvertTo-Json
+            $gpgConfig | Out-File ".\\secrets\\gpg\\config.json"
+            
+            Write-Host "✅ GPG credentials stored"
+        artifact_paths:
+          - ".secrets/gpg/**/*"
+        agents:
+          queue: "windows"
+        depends_on: "checkout-helpers"
+
+      - label: ":key: Configure SSH for Git"
+        key: "configure-ssh"
+        commands:
+          - buildkite-agent artifact download ".secrets/ssh/*" .
+          - |
+            Write-Host "--- :key: Configuring SSH for Git operations"
+            
+            # Create .ssh directory
+            $sshDir = "$env:USERPROFILE\\.ssh"
+            New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+            
+            # Copy private key and set permissions
+            Copy-Item ".\\secrets\\ssh\\id_rsa" "$sshDir\\id_rsa"
+            
+            # Set restrictive permissions on private key (Windows equivalent)
+            $acl = Get-Acl "$sshDir\\id_rsa"
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+              [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+              "FullControl",
+              "Allow"
+            )
+            $acl.SetAccessRule($rule)
+            Set-Acl "$sshDir\\id_rsa" $acl
+            
+            # Configure SSH known hosts for GitHub
+            $knownHosts = "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+            $knownHosts | Out-File "$sshDir\\known_hosts" -Encoding ASCII -Append
+            
+            # Load git config from secrets
+            $sshConfig = Get-Content ".\\secrets\\ssh\\config.json" | ConvertFrom-Json
+            
+            # Configure Git for SSH auth
+            git config --global user.name $sshConfig.git_user
+            git config --global user.email $sshConfig.git_email
+            git config --global core.sshCommand "ssh -i $sshDir\\id_rsa -o StrictHostKeyChecking=yes"
+            
+            Write-Host "✅ SSH configured for Git operations"
+            Write-Host "  Git User: $($sshConfig.git_user)"
+            Write-Host "  Git Email: $($sshConfig.git_email)"
+            Write-Host "  Key Fingerprint: $($sshConfig.fingerprint)"
+        agents:
+          queue: "windows"
+        depends_on: "fetch-secrets"
+
+      - label: ":lock: Configure GPG for Commit Signing"
+        key: "configure-gpg"
+        commands:
+          - buildkite-agent artifact download ".secrets/gpg/*" .
+          - |
+            Write-Host "--- :lock: Configuring GPG for commit signing"
+            
+            # Load GPG config
+            $gpgConfig = Get-Content ".\\secrets\\gpg\\config.json" | ConvertFrom-Json
+            
+            # Import GPG private key
+            Write-Host "--- :key: Importing GPG private key"
+            
+            # Create a batch file for passphrase
+            $env:GPG_PASSPHRASE = $gpgConfig.passphrase
+            
+            # Import the key (non-interactive)
+            $gpgImport = Start-Process -FilePath "gpg" -ArgumentList @(
+              "--batch",
+              "--yes",
+              "--pinentry-mode", "loopback",
+              "--passphrase", $gpgConfig.passphrase,
+              "--import", ".\\secrets\\gpg\\private.asc"
+            ) -Wait -PassThru -NoNewWindow
+            
+            if ($gpgImport.ExitCode -eq 0) {
+              Write-Host "✅ GPG key imported successfully"
+            } else {
+              Write-Warning "⚠️ GPG import may have had issues (exit code: $($gpgImport.ExitCode))"
+            }
+            
+            # Trust the key ultimately
+            Write-Host "--- :shield: Setting GPG key trust"
+            $trustCommand = "$($gpgConfig.fingerprint):6:"
+            $trustCommand | gpg --batch --import-ownertrust
+            
+            # Configure Git to use GPG for signing
+            Write-Host "--- :pencil2: Configuring Git for GPG signing"
+            git config --global user.signingkey $gpgConfig.key_id
+            git config --global commit.gpgsign true
+            git config --global tag.gpgsign true
+            git config --global gpg.program "gpg"
+            
+            # Set GPG_TTY for non-interactive signing
+            $env:GPG_TTY = ""
+            
+            # Create gpg-agent config for non-interactive use
+            $gpgHome = "$env:APPDATA\\gnupg"
+            New-Item -ItemType Directory -Force -Path $gpgHome | Out-Null
+            @"
+            allow-loopback-pinentry
+            default-cache-ttl 3600
+            max-cache-ttl 7200
+"@ | Out-File "$gpgHome\\gpg-agent.conf" -Encoding ASCII
+            
+            # Preset the passphrase in gpg-agent
+            $keygrip = (gpg --with-keygrip --list-secret-keys $gpgConfig.key_id | Select-String "Keygrip" | Select-Object -First 1) -replace ".*Keygrip = ", ""
+            if ($keygrip) {
+              $passphraseHex = [System.BitConverter]::ToString([System.Text.Encoding]::UTF8.GetBytes($gpgConfig.passphrase)) -replace "-", ""
+              gpg-connect-agent "PRESET_PASSPHRASE $keygrip -1 $passphraseHex" /bye
+              Write-Host "✅ GPG passphrase cached"
+            }
+            
+            Write-Host "✅ GPG configured for commit signing"
+            Write-Host "  Key ID: $($gpgConfig.key_id)"
+            Write-Host "  Fingerprint: $($gpgConfig.fingerprint)"
+            
+            # Verify GPG setup
+            Write-Host "--- :mag: Verifying GPG setup"
+            gpg --list-secret-keys --keyid-format LONG
+        agents:
+          queue: "windows"
+        depends_on: "fetch-gpg-secrets"
+
+      - label: ":pencil2: Configure Cosign for Plan Signing"
+        key: "configure-cosign"
+        commands:
+          - buildkite-agent artifact download ".secrets/cosign/*" .
+          - |
+            Write-Host "--- :pencil2: Configuring Cosign for plan signing"
+            
+            # Create cosign directory
+            $cosignDir = "$env:USERPROFILE\\.cosign"
+            New-Item -ItemType Directory -Force -Path $cosignDir | Out-Null
+            
+            # Copy keys
+            Copy-Item ".\\secrets\\cosign\\cosign.key" "$cosignDir\\cosign.key"
+            Copy-Item ".\\secrets\\cosign\\cosign.pub" "$cosignDir\\cosign.pub"
+            
+            # Set environment variable for cosign password if present
+            if (Test-Path ".\\secrets\\cosign\\password.txt") {
+              $env:COSIGN_PASSWORD = Get-Content ".\\secrets\\cosign\\password.txt" -Raw
+            }
+            
+            # Set cosign key paths as environment variables
+            $env:COSIGN_KEY = "$cosignDir\\cosign.key"
+            $env:COSIGN_PUBLIC_KEY = "$cosignDir\\cosign.pub"
+            
+            Write-Host "✅ Cosign configured"
+            Write-Host "  Private Key: $cosignDir\\cosign.key"
+            Write-Host "  Public Key: $cosignDir\\cosign.pub"
+            
+            # Verify cosign is available
+            Write-Host "--- :mag: Verifying Cosign installation"
+            cosign version
+        agents:
+          queue: "windows"
+        depends_on: "fetch-cosign-secrets"
+
+      - label: ":opa: Download OPA Bundles"
+        key: "download-opa-bundles"
+        commands:
+          - |
+            buildkite-agent artifact download ".secrets/**/*" .
+            
+            # Create OPA directory
+            New-Item -ItemType Directory -Force -Path ".\\opa-policies" | Out-Null
+            
+            # Get OPA credentials if available
+            $headers = @{}
+            if (Test-Path ".\\secrets\\opa.json") {
+              $opaCreds = Get-Content ".\\secrets\\opa.json" | ConvertFrom-Json
+              if ($opaCreds.token) {
+                $headers["Authorization"] = "Bearer $($opaCreds.token)"
+              }
+            }
+            
+            # Download OPA bundle
+            Write-Host "--- :opa: Downloading OPA policy bundle"
+            try {
+              $bundleParams = @{
+                Uri = "$env:OPA_BUNDLE_URL"
+                OutFile = ".\\opa-policies\\bundle.tar.gz"
+                Headers = $headers
+              }
+              Invoke-WebRequest @bundleParams
+              
+              # Extract bundle
+              Write-Host "--- :package: Extracting OPA bundle"
+              tar -xzf ".\\opa-policies\\bundle.tar.gz" -C ".\\opa-policies"
+              Remove-Item ".\\opa-policies\\bundle.tar.gz"
+              
+              Write-Host "✅ OPA policies downloaded successfully"
+              Get-ChildItem -Recurse ".\\opa-policies" | Select-Object FullName
+            } catch {
+              Write-Warning "⚠️ Failed to download OPA bundle: $_"
+              # Create empty policy dir so pipeline can continue
+              "# No policies downloaded" | Out-File ".\\opa-policies\\empty.rego"
+            }
+        artifact_paths:
+          - ".opa-policies/**/*"
+        agents:
+          queue: "windows"
+        depends_on: "fetch-secrets"
+        if: build.env("ENABLE_OPA_VALIDATION") == "true"
+
+  # ============================================================================
+  # PHASE 1: BUILD & VALIDATION
+  # ============================================================================
+  
+  - group: "📦 Build & Validation Phase"
+    key: "build-phase"
+    depends_on: "setup-phase"
+    steps:
+      
+      - label: ":hammer: Code Formatting Check"
+        key: "format-check"
+        command: "powershell -File .\\scripts\\Check-TerraformFormatting.ps1"
+        agents:
+          queue: "OpenTofu"
+
+      - label: ":package: Validate Module Sources"
+        key: "validate-modules"
+        command: "powershell -File .\\scripts\\Validate-ModuleSources.ps1"
+        agents:
+          queue: "OpenTofu"
+
+      - label: ":shield: Security Scanning"
+        key: "security-scan"
+        commands:
+          - buildkite-agent artifact download ".secrets/**/*" .
+          - |
+            powershell -File .\\scripts\\Run-SecurityScanning.ps1 `
+              -MondooCredsFile ".\\secrets\\providers\\mondoo.json"
+        artifact_paths:
+          - "security-reports/**/*"
+        agents:
+          queue: "OpenTofu"
+
+      - label: ":opa: OPA Policy Validation"
+        key: "opa-validation"
+        commands:
+          - buildkite-agent artifact download ".opa-policies/**/*" .
+          - buildkite-agent artifact download ".secrets/**/*" .
+          - |
+            Write-Host "--- :terraform: Generating Terraform Plan JSON"
+            
+            # Load Lynx credentials
+            $lynxCreds = Get-Content ".\\secrets\\lynx.json" | ConvertFrom-Json
+            $lynxUsername = $lynxCreds.username
+            $lynxPassword = $lynxCreds.password
+            
+            # Initialize Terraform with Lynx backend
+            $backendConfig = @(
+              "-backend-config=address=$env:LYNX_BASE_URL/api/v1/state/$env:PROJECT_NAME/$env:SERVICE_NAME"
+              "-backend-config=lock_address=$env:LYNX_BASE_URL/api/v1/state/$env:PROJECT_NAME/$env:SERVICE_NAME/lock"
+              "-backend-config=unlock_address=$env:LYNX_BASE_URL/api/v1/state/$env:PROJECT_NAME/$env:SERVICE_NAME/lock"
+              "-backend-config=username=$lynxUsername"
+              "-backend-config=password=$lynxPassword"
+            )
+            
+            terraform init @backendConfig
+            
+            # Generate plan in JSON format for OPA
+            terraform plan -out=tfplan.binary
+            terraform show -json tfplan.binary > tfplan.json
+            
+            Write-Host "--- :opa: Running OPA policy checks"
+            
+            # Run OPA evaluation
+            $violations = opa eval `
+              --format json `
+              --input tfplan.json `
+              --data ".\\opa-policies" `
+              "data.$env:OPA_POLICY_PATH.deny" | ConvertFrom-Json
+            
+            $violationCount = $violations.result[0].expressions[0].value.Count
+            
+            if ($violationCount -gt 0) {
+              Write-Host "❌ OPA Policy Violations Found: $violationCount" -ForegroundColor Red
+              
+              # Pretty print violations
+              opa eval `
+                --format pretty `
+                --input tfplan.json `
+                --data ".\\opa-policies" `
+                "data.$env:OPA_POLICY_PATH.deny"
+              
+              # Also check for warnings
+              Write-Host "`n--- :warning: OPA Warnings:"
+              opa eval `
+                --format pretty `
+                --input tfplan.json `
+                --data ".\\opa-policies" `
+                "data.$env:OPA_POLICY_PATH.warn"
+              
+              exit 1
+            }
+            
+            Write-Host "✅ All OPA policy checks passed" -ForegroundColor Green
+            
+            # Show any warnings
+            $warnings = opa eval `
+              --format json `
+              --input tfplan.json `
+              --data ".\\opa-policies" `
+              "data.$env:OPA_POLICY_PATH.warn" | ConvertFrom-Json
+            
+            $warningCount = $warnings.result[0].expressions[0].value.Count
+            if ($warningCount -gt 0) {
+              Write-Host "`n⚠️ OPA Warnings ($warningCount):" -ForegroundColor Yellow
+              opa eval `
+                --format pretty `
+                --input tfplan.json `
+                --data ".\\opa-policies" `
+                "data.$env:OPA_POLICY_PATH.warn"
+            }
+        artifact_paths:
+          - "tfplan.json"
+          - "opa-results/**/*"
+        agents:
+          queue: "OpenTofu"
+        if: build.env("ENABLE_OPA_VALIDATION") == "true"
+
+      - label: ":books: Generate Documentation"
+        key: "generate-docs"
+        command: "powershell -File .\\scripts\\Generate-TerraformDocs.ps1"
+        artifact_paths:
+          - "TERRAFORM.md"
+          - "*/README.md"
+        agents:
+          queue: "OpenTofu"
+        if: build.env("ENABLE_AUTO_DOCUMENTATION") == "true"
+
+  # ============================================================================
+  # PHASE 2: TERRAFORM PLAN (Per Environment)
+  # ============================================================================
+  
+  - wait: ~
+    continue_on_failure: false
+
+  - group: "📋 Terraform Plan Phase"
+    key: "plan-phase"
+    depends_on: "build-phase"
+    steps:
+      
+      - label: ":terraform: Plan - ${ENVIRONMENT}"
+        key: "terraform-plan-${ENVIRONMENT}"
+        commands:
+          - buildkite-agent artifact download ".secrets/**/*" .
+          - |
+            Write-Host "--- :key: Loading credentials"
+            $lynxCreds = Get-Content ".\\secrets\\lynx.json" | ConvertFrom-Json
+            $lynxUsername = $lynxCreds.username
+            $lynxPassword = $lynxCreds.password
+            
+            # Load provider credentials and set environment variables
+            $providers = $env:REQUIRED_PROVIDERS -split ","
+            foreach ($provider in $providers) {
+              $provider = $provider.Trim()
+              $credsFile = ".\\secrets\\providers\\$provider.json"
+              if (Test-Path $credsFile) {
+                $creds = Get-Content $credsFile | ConvertFrom-Json
+                foreach ($prop in $creds.PSObject.Properties) {
+                  $envVarName = "$($provider.ToUpper())_$($prop.Name.ToUpper())"
+                  [Environment]::SetEnvironmentVariable($envVarName, $prop.Value, "Process")
+                  Write-Host "  Set $envVarName"
+                }
+              }
+            }
+            
+            # Setup Cosign for plan signing
+            $cosignDir = "$env:USERPROFILE\\.cosign"
+            New-Item -ItemType Directory -Force -Path $cosignDir | Out-Null
+            Copy-Item ".\\secrets\\cosign\\cosign.key" "$cosignDir\\cosign.key"
+            Copy-Item ".\\secrets\\cosign\\cosign.pub" "$cosignDir\\cosign.pub"
+            if (Test-Path ".\\secrets\\cosign\\password.txt") {
+              $env:COSIGN_PASSWORD = Get-Content ".\\secrets\\cosign\\password.txt" -Raw
+            }
+            
+            Write-Host "--- :terraform: Terraform Init"
+            $backendConfig = @(
+              "-backend-config=address=$env:LYNX_BASE_URL/api/v1/state/$env:PROJECT_NAME/$env:SERVICE_NAME-$env:ENVIRONMENT"
+              "-backend-config=lock_address=$env:LYNX_BASE_URL/api/v1/state/$env:PROJECT_NAME/$env:SERVICE_NAME-$env:ENVIRONMENT/lock"
+              "-backend-config=unlock_address=$env:LYNX_BASE_URL/api/v1/state/$env:PROJECT_NAME/$env:SERVICE_NAME-$env:ENVIRONMENT/lock"
+              "-backend-config=username=$lynxUsername"
+              "-backend-config=password=$lynxPassword"
+            )
+            
+            terraform init @backendConfig
+            
+            Write-Host "--- :terraform: Terraform Plan"
+            terraform plan `
+              -var-file="environments\\$env:ENVIRONMENT.tfvars" `
+              -out="tfplan-$env:ENVIRONMENT.binary"
+            
+            # Generate plan summary
+            terraform show -no-color "tfplan-$env:ENVIRONMENT.binary" > "tfplan-$env:ENVIRONMENT.txt"
+            
+            # Generate JSON plan for OPA and signing
+            terraform show -json "tfplan-$env:ENVIRONMENT.binary" > "tfplan-$env:ENVIRONMENT.json"
+            
+            Write-Host "--- :pencil2: Signing Terraform plan with Cosign"
+            cosign sign-blob `
+              --key "$cosignDir\\cosign.key" `
+              --output-signature "tfplan-$env:ENVIRONMENT.sig" `
+              "tfplan-$env:ENVIRONMENT.json"
+            
+            Write-Host "--- :mag: Verifying plan signature"
+            cosign verify-blob `
+              --key "$cosignDir\\cosign.pub" `
+              --signature "tfplan-$env:ENVIRONMENT.sig" `
+              "tfplan-$env:ENVIRONMENT.json"
+            
+            Write-Host "✅ Plan signed and verified successfully"
+            
+            Write-Host "--- :memo: Plan Summary"
+            Get-Content "tfplan-$env:ENVIRONMENT.txt" | Select-Object -Last 20
+        env:
+          ENVIRONMENT: "${ENVIRONMENT}"
+        artifact_paths:
+          - "tfplan-${ENVIRONMENT}.binary"
+          - "tfplan-${ENVIRONMENT}.txt"
+          - "tfplan-${ENVIRONMENT}.json"
+          - "tfplan-${ENVIRONMENT}.sig"
+        agents:
+          queue: "OpenTofu"
+        matrix:
+          setup:
+            ENVIRONMENT:
+              - "dev"
+              - "stg"
+              - "prd"
+
+  # ============================================================================
+  # PHASE 3: APPROVAL (if required)
+  # ============================================================================
+  
+  - block: ":raised_hand: Approve Deployment"
+    key: "approve-deployment"
+    depends_on: "plan-phase"
+    if: build.env("REQUIRE_APPROVAL") == "true"
+    prompt: "Review the Terraform plans and approve deployment to proceed."
+    fields:
+      - text: "Approval Notes"
+        key: "approval-notes"
+        hint: "Optional notes for this deployment approval"
+        required: false
+
+  # ============================================================================
+  # PHASE 4: TERRAFORM APPLY (Per Environment)
+  # ============================================================================
+  
+  - group: "🚀 Terraform Apply Phase"
+    key: "apply-phase"
+    depends_on:
+      - "plan-phase"
+      - "approve-deployment"
+    if: build.branch == "main"
+    steps:
+      
+      - label: ":terraform: Apply - ${ENVIRONMENT}"
+        key: "terraform-apply-${ENVIRONMENT}"
+        commands:
+          - buildkite-agent artifact download ".secrets/**/*" .
+          - buildkite-agent artifact download "tfplan-${ENVIRONMENT}.binary" .
+          - buildkite-agent artifact download "tfplan-${ENVIRONMENT}.json" .
+          - buildkite-agent artifact download "tfplan-${ENVIRONMENT}.sig" .
+          - |
+            Write-Host "--- :key: Loading credentials"
+            $lynxCreds = Get-Content ".\\secrets\\lynx.json" | ConvertFrom-Json
+            $lynxUsername = $lynxCreds.username
+            $lynxPassword = $lynxCreds.password
+            
+            # Setup Cosign for signature verification
+            $cosignDir = "$env:USERPROFILE\\.cosign"
+            New-Item -ItemType Directory -Force -Path $cosignDir | Out-Null
+            Copy-Item ".\\secrets\\cosign\\cosign.pub" "$cosignDir\\cosign.pub"
+            
+            Write-Host "--- :mag: Verifying plan signature before apply"
+            cosign verify-blob `
+              --key "$cosignDir\\cosign.pub" `
+              --signature "tfplan-$env:ENVIRONMENT.sig" `
+              "tfplan-$env:ENVIRONMENT.json"
+            
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "❌ Plan signature verification failed! Aborting apply."
+              exit 1
+            }
+            Write-Host "✅ Plan signature verified"
+            
+            # Load provider credentials
+            $providers = $env:REQUIRED_PROVIDERS -split ","
+            foreach ($provider in $providers) {
+              $provider = $provider.Trim()
+              $credsFile = ".\\secrets\\providers\\$provider.json"
+              if (Test-Path $credsFile) {
+                $creds = Get-Content $credsFile | ConvertFrom-Json
+                foreach ($prop in $creds.PSObject.Properties) {
+                  $envVarName = "$($provider.ToUpper())_$($prop.Name.ToUpper())"
+                  [Environment]::SetEnvironmentVariable($envVarName, $prop.Value, "Process")
+                }
+              }
+            }
+            
+            Write-Host "--- :terraform: Terraform Init"
+            $backendConfig = @(
+              "-backend-config=address=$env:LYNX_BASE_URL/api/v1/state/$env:PROJECT_NAME/$env:SERVICE_NAME-$env:ENVIRONMENT"
+              "-backend-config=lock_address=$env:LYNX_BASE_URL/api/v1/state/$env:PROJECT_NAME/$env:SERVICE_NAME-$env:ENVIRONMENT/lock"
+              "-backend-config=unlock_address=$env:LYNX_BASE_URL/api/v1/state/$env:PROJECT_NAME/$env:SERVICE_NAME-$env:ENVIRONMENT/lock"
+              "-backend-config=username=$lynxUsername"
+              "-backend-config=password=$lynxPassword"
+            )
+            
+            terraform init @backendConfig
+            
+            Write-Host "--- :terraform: Terraform Apply"
+            terraform apply -auto-approve "tfplan-$env:ENVIRONMENT.binary"
+            
+            Write-Host "--- :white_check_mark: Apply Complete"
+            terraform output -json > "outputs-$env:ENVIRONMENT.json"
+        env:
+          ENVIRONMENT: "${ENVIRONMENT}"
+        artifact_paths:
+          - "outputs-${ENVIRONMENT}.json"
+        agents:
+          queue: "OpenTofu"
+        matrix:
+          setup:
+            ENVIRONMENT:
+              - "dev"
+              - "stg"
+              - "prd"
+        concurrency: 1
+        concurrency_group: "terraform-apply-${PROJECT_NAME}-${ENVIRONMENT}"
+
+      - label: ":git: Commit Changes with GPG Signing"
+        key: "commit-changes"
+        commands:
+          - buildkite-agent artifact download ".secrets/**/*" .
+          - buildkite-agent artifact download "outputs-*.json" .
+          - |
+            Write-Host "--- :key: Configuring SSH for Git"
+            
+            # Setup SSH
+            $sshDir = "$env:USERPROFILE\\.ssh"
+            New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+            Copy-Item ".\\secrets\\ssh\\id_rsa" "$sshDir\\id_rsa"
+            
+            # Set permissions
+            $acl = Get-Acl "$sshDir\\id_rsa"
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+              [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+              "FullControl",
+              "Allow"
+            )
+            $acl.SetAccessRule($rule)
+            Set-Acl "$sshDir\\id_rsa" $acl
+            
+            # Known hosts
+            "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" | Out-File "$sshDir\\known_hosts" -Encoding ASCII
+            
+            # SSH config from secrets
+            $sshConfig = Get-Content ".\\secrets\\ssh\\config.json" | ConvertFrom-Json
+            git config --global core.sshCommand "ssh -i $sshDir\\id_rsa -o StrictHostKeyChecking=yes"
+            
+            Write-Host "--- :lock: Configuring GPG for commit signing"
+            
+            # Load GPG config
+            $gpgConfig = Get-Content ".\\secrets\\gpg\\config.json" | ConvertFrom-Json
+            
+            # Import GPG key
+            $env:GPG_PASSPHRASE = $gpgConfig.passphrase
+            Start-Process -FilePath "gpg" -ArgumentList @(
+              "--batch", "--yes", "--pinentry-mode", "loopback",
+              "--passphrase", $gpgConfig.passphrase,
+              "--import", ".\\secrets\\gpg\\private.asc"
+            ) -Wait -NoNewWindow
+            
+            # Trust the key
+            "$($gpgConfig.fingerprint):6:" | gpg --batch --import-ownertrust
+            
+            # Configure Git for GPG signing
+            git config --global user.name $gpgConfig.git_user
+            git config --global user.email $gpgConfig.git_email
+            git config --global user.signingkey $gpgConfig.key_id
+            git config --global commit.gpgsign true
+            git config --global tag.gpgsign true
+            git config --global gpg.program "gpg"
+            
+            # Preset passphrase for non-interactive signing
+            $keygrip = (gpg --with-keygrip --list-secret-keys $gpgConfig.key_id | Select-String "Keygrip" | Select-Object -First 1) -replace ".*Keygrip = ", ""
+            if ($keygrip) {
+              $passphraseHex = [System.BitConverter]::ToString([System.Text.Encoding]::UTF8.GetBytes($gpgConfig.passphrase)) -replace "-", ""
+              gpg-connect-agent "PRESET_PASSPHRASE $keygrip -1 $passphraseHex" /bye 2>$null
+            }
+            
+            Write-Host "--- :git: Checking for changes to commit"
+            
+            # Check if there are any changes
+            git fetch origin $env:BUILDKITE_BRANCH
+            git checkout $env:BUILDKITE_BRANCH
+            
+            # Copy outputs to repo
+            New-Item -ItemType Directory -Force -Path "state-outputs" | Out-Null
+            Copy-Item "outputs-*.json" "state-outputs\\"
+            
+            # Add and check for changes
+            git add state-outputs/
+            
+            $changes = git diff --cached --name-only
+            if ($changes) {
+              Write-Host "--- :pencil2: Committing changes with GPG signature"
+              
+              $commitMsg = "chore: update terraform outputs for $env:SERVICE_NAME`n`nBuild: $env:BUILDKITE_BUILD_URL`nCommit: $env:BUILDKITE_COMMIT"
+              git commit -S -m $commitMsg
+              
+              Write-Host "--- :arrow_up: Pushing signed commit"
+              git push origin $env:BUILDKITE_BRANCH
+              
+              Write-Host "✅ Changes committed and pushed with GPG signature"
+            } else {
+              Write-Host "ℹ️ No changes to commit"
+            }
+        agents:
+          queue: "OpenTofu"
+        depends_on:
+          - "terraform-apply-dev"
+          - "terraform-apply-stg"
+          - "terraform-apply-prd"
+
+      - label: ":label: Create GPG Signed Tag"
+        key: "create-tag"
+        commands:
+          - buildkite-agent artifact download ".secrets/**/*" .
+          - |
+            Write-Host "--- :key: Configuring SSH and GPG"
+            
+            # Setup SSH
+            $sshDir = "$env:USERPROFILE\\.ssh"
+            New-Item -ItemType Directory -Force -Path $sshDir | Out-Null
+            Copy-Item ".\\secrets\\ssh\\id_rsa" "$sshDir\\id_rsa"
+            
+            $acl = Get-Acl "$sshDir\\id_rsa"
+            $acl.SetAccessRuleProtection($true, $false)
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+              [System.Security.Principal.WindowsIdentity]::GetCurrent().Name,
+              "FullControl",
+              "Allow"
+            )
+            $acl.SetAccessRule($rule)
+            Set-Acl "$sshDir\\id_rsa" $acl
+            
+            "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" | Out-File "$sshDir\\known_hosts" -Encoding ASCII
+            
+            $sshConfig = Get-Content ".\\secrets\\ssh\\config.json" | ConvertFrom-Json
+            git config --global core.sshCommand "ssh -i $sshDir\\id_rsa -o StrictHostKeyChecking=yes"
+            
+            # Setup GPG
+            $gpgConfig = Get-Content ".\\secrets\\gpg\\config.json" | ConvertFrom-Json
+            
+            Start-Process -FilePath "gpg" -ArgumentList @(
+              "--batch", "--yes", "--pinentry-mode", "loopback",
+              "--passphrase", $gpgConfig.passphrase,
+              "--import", ".\\secrets\\gpg\\private.asc"
+            ) -Wait -NoNewWindow
+            
+            "$($gpgConfig.fingerprint):6:" | gpg --batch --import-ownertrust
+            
+            git config --global user.name $gpgConfig.git_user
+            git config --global user.email $gpgConfig.git_email
+            git config --global user.signingkey $gpgConfig.key_id
+            git config --global tag.gpgsign true
+            git config --global gpg.program "gpg"
+            
+            # Preset passphrase
+            $keygrip = (gpg --with-keygrip --list-secret-keys $gpgConfig.key_id | Select-String "Keygrip" | Select-Object -First 1) -replace ".*Keygrip = ", ""
+            if ($keygrip) {
+              $passphraseHex = [System.BitConverter]::ToString([System.Text.Encoding]::UTF8.GetBytes($gpgConfig.passphrase)) -replace "-", ""
+              gpg-connect-agent "PRESET_PASSPHRASE $keygrip -1 $passphraseHex" /bye 2>$null
+            }
+            
+            Write-Host "--- :label: Creating GPG signed tag"
+            
+            git fetch origin $env:BUILDKITE_BRANCH
+            git checkout $env:BUILDKITE_BRANCH
+            git pull origin $env:BUILDKITE_BRANCH
+            
+            # Generate tag name based on date and build number
+            $tagName = "deploy-$(Get-Date -Format 'yyyy.MM.dd')-$env:BUILDKITE_BUILD_NUMBER"
+            $tagMessage = @"
+            Deployment $tagName
+            
+            Service: $env:SERVICE_NAME
+            Project: $env:PROJECT_NAME
+            Environments: $env:TARGET_ENVIRONMENTS
+            Build: $env:BUILDKITE_BUILD_URL
+            Commit: $env:BUILDKITE_COMMIT
+"@
+            
+            Write-Host "Creating signed tag: $tagName"
+            git tag -s -m $tagMessage $tagName
+            
+            Write-Host "--- :arrow_up: Pushing signed tag"
+            git push origin $tagName
+            
+            Write-Host "✅ GPG signed tag created and pushed: $tagName"
+        agents:
+          queue: "OpenTofu"
+        depends_on: "commit-changes"
+        if: build.branch == "main"
+
+  # ============================================================================
+  # PHASE 5: POST-DEPLOYMENT
+  # ============================================================================
+  
+  - group: "📊 Post-Deployment Phase"
+    key: "post-deploy-phase"
+    depends_on: "apply-phase"
+    if: build.branch == "main"
+    steps:
+      
+      - label: ":memo: Update State Documentation"
+        key: "update-state-docs"
+        commands:
+          - buildkite-agent artifact download "outputs-*.json" .
+          - |
+            Write-Host "--- :memo: Generating state documentation"
+            
+            $environments = $env:TARGET_ENVIRONMENTS -split ","
+            $stateDoc = "# Terraform State Summary`n`n"
+            $stateDoc += "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')`n`n"
+            
+            foreach ($env in $environments) {
+              $env = $env.Trim()
+              $outputFile = "outputs-$env.json"
+              if (Test-Path $outputFile) {
+                $outputs = Get-Content $outputFile | ConvertFrom-Json
+                $stateDoc += "## $($env.ToUpper())`n`n"
+                $stateDoc += "``````json`n"
+                $stateDoc += ($outputs | ConvertTo-Json -Depth 10)
+                $stateDoc += "`n```````n`n"
+              }
+            }
+            
+            $stateDoc | Out-File "STATE_SUMMARY.md" -Encoding UTF8
+            Write-Host "✅ State documentation generated"
+        artifact_paths:
+          - "STATE_SUMMARY.md"
+        agents:
+          queue: "OpenTofu"
+
+      - label: ":bell: Send Deployment Notification"
+        key: "notify-deployment"
+        commands:
+          - |
+            if ([string]::IsNullOrEmpty($env:WEBHOOK_URL)) {
+              Write-Host "⚠️ No webhook URL configured, skipping notification"
+              exit 0
+            }
+            
+            $payload = @{
+              event = "deployment_complete"
+              project = $env:PROJECT_NAME
+              service = $env:SERVICE_NAME
+              environments = $env:TARGET_ENVIRONMENTS
+              build_url = $env:BUILDKITE_BUILD_URL
+              commit = $env:BUILDKITE_COMMIT
+              branch = $env:BUILDKITE_BRANCH
+              timestamp = (Get-Date -Format "o")
+            } | ConvertTo-Json
+            
+            try {
+              Invoke-RestMethod -Uri $env:WEBHOOK_URL -Method POST -Body $payload -ContentType "application/json"
+              Write-Host "✅ Deployment notification sent"
+            } catch {
+              Write-Warning "⚠️ Failed to send notification: $_"
+            }
+        agents:
+          queue: "windows"
+        soft_fail: true
+
+  # ============================================================================
+  # CLEANUP
+  # ============================================================================
+  
+  - wait: ~
+    continue_on_failure: true
+
+  - label: ":broom: Cleanup Secrets"
+    key: "cleanup"
+    commands:
+      - |
+        Write-Host "--- :broom: Cleaning up sensitive files"
+        
+        # Remove secrets directory
+        if (Test-Path ".\\secrets") {
+          Remove-Item -Recurse -Force ".\\secrets"
+          Write-Host "✅ Secrets directory removed"
+        }
+        
+        # Remove OPA policies
+        if (Test-Path ".\\opa-policies") {
+          Remove-Item -Recurse -Force ".\\opa-policies"
+          Write-Host "✅ OPA policies directory removed"
+        }
+        
+        # Clean up SSH keys
+        $sshKeyPath = "$env:USERPROFILE\\.ssh\\id_rsa"
+        if (Test-Path $sshKeyPath) {
+          Remove-Item -Force $sshKeyPath
+          Write-Host "✅ SSH private key removed"
+        }
+        
+        # Clean up Cosign keys
+        $cosignDir = "$env:USERPROFILE\\.cosign"
+        if (Test-Path $cosignDir) {
+          Remove-Item -Recurse -Force $cosignDir
+          Write-Host "✅ Cosign keys removed"
+        }
+        
+        # Clean up GPG keys
+        Write-Host "--- :lock: Removing GPG keys"
+        try {
+          $gpgKeys = gpg --list-secret-keys --keyid-format LONG 2>$null | Select-String "sec" | ForEach-Object {
+            ($_ -split "/")[1] -split " " | Select-Object -First 1
+          }
+          foreach ($keyId in $gpgKeys) {
+            if ($keyId) {
+              gpg --batch --yes --delete-secret-keys $keyId 2>$null
+              gpg --batch --yes --delete-keys $keyId 2>$null
+            }
+          }
+          Write-Host "✅ GPG keys removed"
+        } catch {
+          Write-Warning "⚠️ Could not remove GPG keys: $_"
+        }
+        
+        # Clear GPG agent cache
+        gpg-connect-agent reloadagent /bye 2>$null
+        
+        # Clean up plan files
+        Get-ChildItem -Filter "tfplan-*.binary" -ErrorAction SilentlyContinue | Remove-Item -Force
+        Get-ChildItem -Filter "tfplan-*.json" -ErrorAction SilentlyContinue | Remove-Item -Force
+        Get-ChildItem -Filter "tfplan-*.sig" -ErrorAction SilentlyContinue | Remove-Item -Force
+        Get-ChildItem -Filter "outputs-*.json" -ErrorAction SilentlyContinue | Remove-Item -Force
+        
+        Write-Host "✅ Cleanup complete"
+    agents:
+      queue: "windows"

@@ -1,0 +1,64 @@
+decisions:
+    "0001":
+        adr_id: "0001"
+        title: Modular approach for secret engines
+        status: open
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments: []
+    "0002":
+        adr_id: "0002"
+        title: ' auth methods'
+        status: open
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments: []
+    "0003":
+        adr_id: "0003"
+        title: ' and policies'
+        status: open
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments: []
+    "0004":
+        adr_id: "0004"
+        title: Use Terraform native testing framework for module validation
+        status: decided
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments:
+            - author: ""
+              date: "2026-02-04 10:37:57"
+              comment: "1"
+    "0005":
+        adr_id: "0005"
+        title: Map-based configuration for flexible resource management
+        status: decided
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments:
+            - author: ""
+              date: "2026-02-04 10:38:12"
+              comment: "1"
+    "0006":
+        adr_id: "0006"
+        title: Comprehensive examples for different use cases
+        status: decided
+        tags: []
+        links:
+            precedes: []
+            succeeds: []
+        comments:
+            - author: ""
+              date: "2026-02-04 10:38:13"
+              comment: "1"
